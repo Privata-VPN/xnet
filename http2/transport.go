@@ -124,6 +124,17 @@ type Transport struct {
 	// Values are bounded in the range 16k to 16M.
 	MaxReadFrameSize uint32
 
+	// MaxAcceptedFrameSize, if non-zero, caps the peer-advertised
+	// SETTINGS_MAX_FRAME_SIZE that this Transport will honor when sizing
+	// outbound DATA frames. The peer's advertised value remains valid
+	// per the spec; the transport simply chooses to send smaller frames.
+	//
+	// This is useful when behind a reverse proxy (e.g. nginx) that hardcodes
+	// the SETTINGS value to the spec maximum (16 MiB), which would otherwise
+	// inflate per-stream write buffers in writeRequestBody. If zero, the
+	// peer's advertised value is used as-is.
+	MaxAcceptedFrameSize uint32
+
 	// MaxDecoderHeaderTableSize optionally specifies the http2
 	// SETTINGS_HEADER_TABLE_SIZE to send in the initial settings frame. It
 	// informs the remote endpoint of the maximum size of the header compression
@@ -2863,6 +2874,14 @@ func (rl *clientConnReadLoop) processSettingsNoWrite(f *SettingsFrame) error {
 		}
 		switch s.ID {
 		case SettingMaxFrameSize:
+			if accepted := cc.t.MaxAcceptedFrameSize; accepted != 0 && s.Val > accepted {
+				if VerboseLogs {
+					cc.vlogf("http2: Transport capping peer SETTINGS_MAX_FRAME_SIZE %d to local cap %d", s.Val, accepted)
+				}
+				s.Val = accepted
+			} else if VerboseLogs {
+				cc.vlogf("http2: Transport received SETTINGS_MAX_FRAME_SIZE = %d (was %d)", s.Val, cc.maxFrameSize)
+			}
 			cc.maxFrameSize = s.Val
 		case SettingMaxConcurrentStreams:
 			cc.maxConcurrentStreams = s.Val
