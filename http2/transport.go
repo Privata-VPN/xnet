@@ -2551,6 +2551,14 @@ func (rl *clientConnReadLoop) processSettingsNoWrite(f *SettingsFrame) error {
 		}
 		switch s.ID {
 		case SettingMaxFrameSize:
+			if accepted := cc.t.MaxAcceptedFrameSize; accepted != 0 && s.Val > accepted {
+				if VerboseLogs {
+					cc.vlogf("http2: Transport capping peer SETTINGS_MAX_FRAME_SIZE %d to local cap %d", s.Val, accepted)
+				}
+				s.Val = accepted
+			} else if VerboseLogs {
+				cc.vlogf("http2: Transport received SETTINGS_MAX_FRAME_SIZE = %d (was %d)", s.Val, cc.maxFrameSize)
+			}
 			cc.maxFrameSize = s.Val
 		case SettingMaxConcurrentStreams:
 			cc.maxConcurrentStreams = s.Val
