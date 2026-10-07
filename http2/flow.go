@@ -14,8 +14,9 @@ const inflowMinRefresh = 4 << 10
 // It tracks both the latest window sent to the peer (used for enforcement)
 // and the accumulated unsent window.
 type inflow struct {
-	avail  int32
-	unsent int32
+	avail      int32
+	unsent     int32
+	minRefresh int32 // if positive, used instead of inflowMinRefresh
 }
 
 // init sets the initial window.
@@ -42,7 +43,11 @@ func (f *inflow) add(n int) (connAdd int32) {
 		panic("flow control update exceeds maximum window size")
 	}
 	f.unsent = int32(unsent)
-	if f.unsent < inflowMinRefresh && f.unsent < f.avail {
+	minRefresh := int32(inflowMinRefresh)
+	if f.minRefresh > 0 {
+		minRefresh = f.minRefresh
+	}
+	if f.unsent < minRefresh && f.unsent < f.avail {
 		// If there aren't at least inflowMinRefresh bytes of window to send,
 		// and this update won't at least double the window, buffer the update for later.
 		return 0

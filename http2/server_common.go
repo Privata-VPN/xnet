@@ -116,6 +116,38 @@ type Server struct {
 	// maximum, a default value will be used instead.
 	MaxUploadBufferPerStream int32
 
+	// WriteBufferSize is the size of the per-connection buffer frames
+	// are encoded into before they are written to the connection. The
+	// serve goroutine encodes frames that fit itself and flushes once
+	// it has nothing left to write; frames that do not fit are written
+	// by the connection's writer goroutine. If zero, 4 KiB is used.
+	//
+	// Only the server that does not wrap net/http honors it.
+	WriteBufferSize int
+
+	// LazyWindowUpdates delays WINDOW_UPDATE frames until a quarter of
+	// a connection or stream receive window has been consumed, instead
+	// of every 4 KiB, saving a frame and a flush per handler read of a
+	// request body. An update is still sent as soon as it would at
+	// least double the window the peer has left.
+	//
+	// Only the server that does not wrap net/http honors it.
+	LazyWindowUpdates bool
+
+	// BatchFlushes holds back flushing the connection while handlers have
+	// frames queued, first yielding to them once if little is buffered, so
+	// that frames of concurrent streams share a write to the connection.
+	//
+	// Only the server that does not wrap net/http honors it.
+	BatchFlushes bool
+
+	// StartHandler, if non-nil, starts the goroutine that runs a request
+	// handler in place of a go statement, for example on a pool of
+	// goroutines. It must not wait for the function to return.
+	//
+	// Only the server that does not wrap net/http honors it.
+	StartHandler func(func())
+
 	// NewWriteScheduler constructs a write scheduler for a connection.
 	// If nil, a default scheduler is chosen.
 	//

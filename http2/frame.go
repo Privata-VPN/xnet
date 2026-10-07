@@ -345,7 +345,13 @@ type Framer struct {
 	debugWriteLoggerf func(string, ...interface{})
 
 	frameCache *frameCache // nil if frames aren't reused (default)
+
+	// metaFieldsHint is the number of fields of the last header block
+	// read, up to maxMetaFieldsHint, to size the next one's Fields.
+	metaFieldsHint int
 }
+
+const maxMetaFieldsHint = 64
 
 func (fr *Framer) maxHeaderListSize() uint32 {
 	if fr.MaxHeaderListSize == 0 {
@@ -712,10 +718,42 @@ func (f *Framer) WriteData(streamID uint32, endStream bool, data []byte) error {
 // It is the caller's responsibility not to violate the maximum frame size
 // and to not call other Write methods concurrently.
 func (f *Framer) WriteDataPadded(streamID uint32, endStream bool, data, pad []byte) error {
+	if pad == nil && !f.logWrites {
+		return f.writeDataUnpadded(streamID, endStream, data)
+	}
 	if err := f.startWriteDataPadded(streamID, endStream, data, pad); err != nil {
 		return err
 	}
 	return f.endWrite()
+}
+
+// writeDataUnpadded writes the frame header and data to f.w separately rather
+// than assembling the frame in f.wbuf first, which saves copying data once.
+// f.w is buffered on both the client and the server.
+func (f *Framer) writeDataUnpadded(streamID uint32, endStream bool, data []byte) error {
+	if !validStreamID(streamID) && !f.AllowIllegalWrites {
+		return errStreamID
+	}
+	if len(data) >= (1 << 24) {
+		return ErrFrameTooLarge
+	}
+	var flags Flags
+	if endStream {
+		flags |= FlagDataEndStream
+	}
+	f.startWrite(FrameData, flags, streamID)
+	f.wbuf[0], f.wbuf[1], f.wbuf[2] = byte(len(data)>>16), byte(len(data)>>8), byte(len(data))
+	if n, err := f.w.Write(f.wbuf); err != nil || n != len(f.wbuf) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		return err
+	}
+	n, err := f.w.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	return err
 }
 
 // startWriteDataPadded is WriteDataPadded, but only writes the frame to the Framer's internal buffer.
@@ -1711,6 +1749,9 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 	mh := &MetaHeadersFrame{
 		HeadersFrame: hf,
 	}
+	if fr.metaFieldsHint > 0 {
+		mh.Fields = make([]hpack.HeaderField, 0, fr.metaFieldsHint)
+	}
 	var remainSize = fr.maxHeaderListSize()
 	var sawRegular bool
 
@@ -1806,6 +1847,7 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 
 	mh.HeadersFrame.headerFragBuf = nil
 	mh.HeadersFrame.invalidate()
+	fr.metaFieldsHint = min(len(mh.Fields), maxMetaFieldsHint)
 
 	if err := hdec.Close(); err != nil {
 		return mh, ConnectionError(ErrCodeCompression)

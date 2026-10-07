@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -942,6 +943,40 @@ func testServer_Handler_Sends_WindowUpdate_Padding(t testing.TB) {
 	st.wantWindowUpdate(1, uint32(len(data)+1+len(pad)))
 }
 
+func TestServer_LazyWindowUpdates(t *testing.T) {
+	synctestTest(t, testServer_LazyWindowUpdates)
+}
+func testServer_LazyWindowUpdates(t testing.TB) {
+	const windowSize = 1 << 20
+	st := newServerTester(t, nil, func(s *Server) {
+		s.MaxUploadBufferPerConnection = windowSize
+		s.MaxUploadBufferPerStream = windowSize
+		s.LazyWindowUpdates = true
+	})
+	defer st.Close()
+
+	st.greet()
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: st.encodeHeader(":method", "POST"),
+		EndStream:     false,
+		EndHeaders:    true,
+	})
+	call := st.nextHandlerCall()
+
+	// Consuming less than a quarter of the window returns no credit.
+	data := make([]byte, windowSize/8)
+	st.writeData(1, false, data)
+	call.do(readBodyHandler(t, string(data)))
+	st.wantIdle()
+
+	// Reaching a quarter of the window returns all of it.
+	st.writeData(1, false, data)
+	call.do(readBodyHandler(t, string(data)))
+	st.wantWindowUpdate(0, windowSize/4)
+	st.wantWindowUpdate(1, windowSize/4)
+}
+
 func TestServer_Send_GoAway_After_Bogus_WindowUpdate(t *testing.T) {
 	synctestTest(t, testServer_Send_GoAway_After_Bogus_WindowUpdate)
 }
@@ -1714,6 +1749,89 @@ func testServer_Response_Header_Flush_MidWrite(t testing.TB) {
 			data:      []byte(msg2),
 		})
 	})
+}
+
+func TestServer_BatchFlushes(t *testing.T) { synctestTest(t, testServer_BatchFlushes) }
+func testServer_BatchFlushes(t testing.TB) {
+	const msg = "<html>this is HTML"
+	const msg2 = ", and this is the next chunk"
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, msg)
+		w.(http.Flusher).Flush()
+		io.WriteString(w, msg2)
+	}, func(s *Server) {
+		s.BatchFlushes = true
+	})
+	defer st.Close()
+	st.greet()
+
+	for _, id := range []uint32{1, 3} {
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      id,
+			BlockFragment: st.encodeHeader(),
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+		st.wantHeaders(wantHeader{
+			streamID:  id,
+			endStream: false,
+			header: http.Header{
+				":status":      []string{"200"},
+				"content-type": []string{"text/html; charset=utf-8"},
+			},
+		})
+		st.wantData(wantData{
+			streamID:  id,
+			endStream: false,
+			data:      []byte(msg),
+		})
+		st.wantData(wantData{
+			streamID:  id,
+			endStream: true,
+			data:      []byte(msg2),
+		})
+	}
+}
+
+func TestServer_StartHandler(t *testing.T) { synctestTest(t, testServer_StartHandler) }
+func testServer_StartHandler(t testing.TB) {
+	var started atomic.Int32
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ok")
+	}, func(s *Server) {
+		s.StartHandler = func(f func()) {
+			started.Add(1)
+			go f()
+		}
+	})
+	defer st.Close()
+	st.greet()
+
+	for _, id := range []uint32{1, 3} {
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      id,
+			BlockFragment: st.encodeHeader(),
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+		st.wantHeaders(wantHeader{
+			streamID:  id,
+			endStream: false,
+			header: http.Header{
+				":status":        []string{"200"},
+				"content-type":   []string{"text/plain; charset=utf-8"},
+				"content-length": []string{"2"},
+			},
+		})
+		st.wantData(wantData{
+			streamID:  id,
+			endStream: true,
+			data:      []byte("ok"),
+		})
+	}
+	if got := started.Load(); got != 2 {
+		t.Errorf("StartHandler called %v times, want 2", got)
+	}
 }
 
 func TestServer_Response_LargeWrite(t *testing.T) { synctestTest(t, testServer_Response_LargeWrite) }
