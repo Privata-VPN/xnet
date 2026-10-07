@@ -262,13 +262,43 @@ type bufferedWriter struct {
 	conn        net.Conn      // immutable
 	bw          *bufio.Writer // non-nil when data is buffered
 	byteTimeout time.Duration // immutable, WriteByteTimeout
+	size        int           // immutable, size of bw
+	pool        *sync.Pool    // immutable, pool of bw
 }
 
 func newBufferedWriter(conn net.Conn, timeout time.Duration) *bufferedWriter {
+	return newBufferedWriterSize(conn, timeout, 0)
+}
+
+// newBufferedWriterSize returns a bufferedWriter whose buffer holds size
+// bytes, or bufWriterPoolBufferSize if size is not positive.
+func newBufferedWriterSize(conn net.Conn, timeout time.Duration, size int) *bufferedWriter {
+	if size <= 0 {
+		size = bufWriterPoolBufferSize
+	}
 	return &bufferedWriter{
 		conn:        conn,
 		byteTimeout: timeout,
+		size:        size,
+		pool:        bufWriterPoolFor(size),
 	}
+}
+
+// bufWriterPools holds a *sync.Pool of *bufio.Writer for every buffer size
+// other than bufWriterPoolBufferSize.
+var bufWriterPools sync.Map
+
+func bufWriterPoolFor(size int) *sync.Pool {
+	if size == bufWriterPoolBufferSize {
+		return &bufWriterPool
+	}
+	if p, ok := bufWriterPools.Load(size); ok {
+		return p.(*sync.Pool)
+	}
+	p, _ := bufWriterPools.LoadOrStore(size, &sync.Pool{
+		New: func() interface{} { return bufio.NewWriterSize(nil, size) },
+	})
+	return p.(*sync.Pool)
 }
 
 // bufWriterPoolBufferSize is the size of bufio.Writer's
@@ -287,14 +317,21 @@ var bufWriterPool = sync.Pool{
 
 func (w *bufferedWriter) Available() int {
 	if w.bw == nil {
-		return bufWriterPoolBufferSize
+		return w.size
 	}
 	return w.bw.Available()
 }
 
+func (w *bufferedWriter) Buffered() int {
+	if w.bw == nil {
+		return 0
+	}
+	return w.bw.Buffered()
+}
+
 func (w *bufferedWriter) Write(p []byte) (n int, err error) {
 	if w.bw == nil {
-		bw := bufWriterPool.Get().(*bufio.Writer)
+		bw := w.pool.Get().(*bufio.Writer)
 		bw.Reset((*bufferedWriterTimeoutWriter)(w))
 		w.bw = bw
 	}
@@ -308,7 +345,7 @@ func (w *bufferedWriter) Flush() error {
 	}
 	err := bw.Flush()
 	bw.Reset(nil)
-	bufWriterPool.Put(bw)
+	w.pool.Put(bw)
 	w.bw = nil
 	return err
 }

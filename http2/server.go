@@ -269,7 +269,7 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 		conn:                        c,
 		baseCtx:                     baseCtx,
 		remoteAddrStr:               c.RemoteAddr().String(),
-		bw:                          newBufferedWriter(c, conf.WriteByteTimeout),
+		bw:                          newBufferedWriterSize(c, conf.WriteByteTimeout, s.WriteBufferSize),
 		handler:                     opts.handler(),
 		streams:                     make(map[uint32]*stream),
 		readFrameCh:                 make(chan readFrameResult),
@@ -424,6 +424,7 @@ type serverConn struct {
 	readFrameCh      chan readFrameResult   // written by serverConn.readFrames
 	wantWriteFrameCh chan FrameWriteRequest // from handlers -> serve
 	wroteFrameCh     chan frameWriteResult  // from writeFrameAsync -> serve, tickles more frame writes
+	asyncWriteCh     chan asyncFrameWrite   // from serve -> writeFrames; closed when serve ends
 	bodyReadCh       chan bodyReadMsg       // from handlers -> serve
 	serveMsgCh       chan interface{}       // misc messages & code to send to / run on the serve loop
 	flow             connOutflow            // conn-wide (not stream-specific) outbound flow control
@@ -736,6 +737,21 @@ func (sc *serverConn) writeFrameAsync(wr FrameWriteRequest, wd *writeData) {
 	sc.wroteFrameCh <- frameWriteResult{wr: wr, err: err}
 }
 
+// asyncFrameWrite is a frame write the serve goroutine hands to writeFrames.
+type asyncFrameWrite struct {
+	wr FrameWriteRequest
+	wd *writeData
+}
+
+// writeFrames runs writeFrameAsync for every write handed to it, so that a
+// connection reuses one writer goroutine, and its grown stack, instead of
+// starting a goroutine per flush.
+func (sc *serverConn) writeFrames() {
+	for w := range sc.asyncWriteCh {
+		sc.writeFrameAsync(w.wr, w.wd)
+	}
+}
+
 func (sc *serverConn) closeAllStreamsOnConnClose() {
 	sc.serveG.check()
 	for _, st := range sc.streams {
@@ -769,6 +785,12 @@ func (sc *serverConn) serve(conf http2Config) {
 	sc.serveG.check()
 	defer sc.notePanic()
 	defer sc.conn.Close()
+	// At most one async write is in flight, so neither side blocks on the
+	// buffered channel. It is closed after closing the streams, which may
+	// still write frames.
+	sc.asyncWriteCh = make(chan asyncFrameWrite, 1)
+	go sc.writeFrames()
+	defer close(sc.asyncWriteCh)
 	defer sc.closeAllStreamsOnConnClose()
 	defer sc.stopShutdownTimer()
 	defer close(sc.doneServing) // unblocks handlers trying to send
@@ -799,6 +821,9 @@ func (sc *serverConn) serve(conf http2Config) {
 	// If a higher value is configured, we add more tokens.
 	if diff := conf.MaxUploadBufferPerConnection - initialWindowSize; diff > 0 {
 		sc.sendWindowUpdate(nil, int(diff))
+	}
+	if sc.srv.LazyWindowUpdates {
+		sc.inflow.minRefresh = max(inflowMinRefresh, max(conf.MaxUploadBufferPerConnection, initialWindowSize)/4)
 	}
 
 	if err := sc.readPreface(); err != nil {
@@ -1194,10 +1219,10 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 		// See https://go.dev/issue/58446.
 		sc.framer.startWriteDataPadded(wd.streamID, wd.endStream, wd.p, nil)
 		sc.writingFrameAsync = true
-		go sc.writeFrameAsync(wr, wd)
+		sc.asyncWriteCh <- asyncFrameWrite{wr, wd}
 	} else {
 		sc.writingFrameAsync = true
-		go sc.writeFrameAsync(wr, nil)
+		sc.asyncWriteCh <- asyncFrameWrite{wr, nil}
 	}
 }
 
@@ -1276,6 +1301,24 @@ func (sc *serverConn) wroteFrame(res frameWriteResult) {
 //
 // If a frame isn't being written and there's nothing else to send, we
 // flush the write buffer.
+// flushBatchSize is how much BatchFlushes wants buffered before flushing
+// without first yielding to handlers that may queue more frames.
+const flushBatchSize = 16 << 10
+
+// moreFramesQueued reports whether handlers have frames queued for the
+// serve goroutine. Unless much is buffered, it yields once first to let
+// them queue more.
+func (sc *serverConn) moreFramesQueued() bool {
+	if len(sc.wantWriteFrameCh) > 0 {
+		return true
+	}
+	if sc.bw.Buffered() >= flushBatchSize {
+		return false
+	}
+	runtime.Gosched()
+	return len(sc.wantWriteFrameCh) > 0
+}
+
 func (sc *serverConn) scheduleFrameWrite() {
 	sc.serveG.check()
 	if sc.writingFrame || sc.inFrameScheduleLoop {
@@ -1316,6 +1359,10 @@ func (sc *serverConn) scheduleFrameWrite() {
 			}
 		}
 		if sc.needsFrameFlush {
+			if sc.srv.BatchFlushes && sc.moreFramesQueued() {
+				// Writing the queued frame schedules writes again.
+				break
+			}
 			sc.startFrameWrite(FrameWriteRequest{write: flushFrameWriter{}})
 			sc.needsFrameFlush = false // after startFrameWrite, since it sets this true
 			continue
@@ -2024,7 +2071,7 @@ func (sc *serverConn) upgradeRequest(req *http.Request) {
 	// so start the handler directly rather than going
 	// through scheduleHandler.
 	sc.curHandlers++
-	go sc.runHandler(rw, req, sc.handler.ServeHTTP)
+	sc.startHandler(rw, req, sc.handler.ServeHTTP)
 }
 
 func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
@@ -2114,6 +2161,9 @@ func (sc *serverConn) newStream(id, pusherID uint32, state streamState, priority
 	st.cw.Init()
 	st.flow.conn = &sc.flow // link to conn-level counter
 	st.inflow.init(sc.initialStreamRecvWindowSize)
+	if sc.srv.LazyWindowUpdates {
+		st.inflow.minRefresh = max(inflowMinRefresh, sc.initialStreamRecvWindowSize/4)
+	}
 	if sc.hs.WriteTimeout > 0 {
 		st.writeDeadline = time.AfterFunc(sc.hs.WriteTimeout, st.onWriteTimeout)
 	}
@@ -2167,10 +2217,20 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		return nil, nil, sc.countError("bad_path_method", streamError(f.StreamID, ErrCodeProtocol))
 	}
 
-	header := make(http.Header)
+	fields := f.RegularFields()
+	header := make(http.Header, len(fields))
 	rp.Header = header
-	for _, hf := range f.RegularFields() {
-		header.Add(sc.canonicalHeader(hf.Name), hf.Value)
+	// Values of distinct keys share one allocation, as in net/textproto.
+	strs := make([]string, len(fields))
+	for _, hf := range fields {
+		key := sc.canonicalHeader(hf.Name)
+		if vv, ok := header[key]; ok {
+			header[key] = append(vv, hf.Value)
+			continue
+		}
+		strs[0] = hf.Value
+		header[key] = strs[:1:1]
+		strs = strs[1:]
 	}
 	if rp.Authority == "" {
 		rp.Authority = header.Get("Host")
@@ -2264,7 +2324,7 @@ func (sc *serverConn) scheduleHandler(st *stream, rw *responseWriter, req *http.
 	maxHandlers := sc.advMaxStreams
 	if sc.curHandlers < maxHandlers {
 		sc.curHandlers++
-		go sc.runHandler(rw, req, handler)
+		sc.startHandler(rw, req, handler)
 		return nil
 	}
 	if len(sc.unstartedHandlers) > int(4*sc.advMaxStreams) {
@@ -2299,13 +2359,21 @@ func (sc *serverConn) handlerDone() {
 			break
 		}
 		sc.curHandlers++
-		go sc.runHandler(u.rw, u.req, u.handler)
+		sc.startHandler(u.rw, u.req, u.handler)
 		sc.unstartedHandlers[i] = unstartedHandler{} // don't retain references
 	}
 	sc.unstartedHandlers = sc.unstartedHandlers[i:]
 	if len(sc.unstartedHandlers) == 0 {
 		sc.unstartedHandlers = nil
 	}
+}
+
+func (sc *serverConn) startHandler(rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) {
+	if start := sc.srv.StartHandler; start != nil {
+		start(func() { sc.runHandler(rw, req, handler) })
+		return
+	}
+	go sc.runHandler(rw, req, handler)
 }
 
 // Run on its own goroutine.
@@ -2488,6 +2556,15 @@ func (b *requestBody) Read(p []byte) (n int, err error) {
 	}
 	b.conn.noteBodyReadFromHandler(b.stream, n, err)
 	return
+}
+
+// Buffered returns the number of body bytes Read can return without
+// waiting for the client.
+func (b *requestBody) Buffered() int {
+	if b.pipe == nil {
+		return 0
+	}
+	return b.pipe.Len()
 }
 
 // responseWriter is the http.ResponseWriter implementation. It's
@@ -3130,7 +3207,7 @@ func (sc *serverConn) startPush(msg *startPushRequest) {
 		}
 
 		sc.curHandlers++
-		go sc.runHandler(rw, req, sc.handler.ServeHTTP)
+		sc.startHandler(rw, req, sc.handler.ServeHTTP)
 		return promisedID, nil
 	}
 
